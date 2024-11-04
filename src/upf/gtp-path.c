@@ -57,24 +57,65 @@
 
 #include <sqlite3.h>
 #include <err.h>
+#include <arpa/inet.h>
+
+void dectoip(uint32_t dec, char *ip);
+void dectoip(uint32_t dec, char *ip)
+{
+    struct in_addr ip_addr;
+
+    ip_addr.s_addr = dec;
+
+    if (inet_ntop(AF_INET, &ip_addr, ip, INET_ADDRSTRLEN) == NULL) {
+        ogs_error("inet_ntop failed");
+    }
+}
+
+uint8_t *query_mac(sqlite3 *db, uint32_t ip_dec, uint8_t *mac);
+uint8_t *query_mac(sqlite3 *db, uint32_t ip_dec, uint8_t *mac) {
+    sqlite3_stmt *stmt;
+    const char *query = "SELECT mac FROM leases where ip = ?;";
+    char ip[INET_ADDRSTRLEN];
+    int rc;
+
+    if (sqlite3_prepare_v2(db, query, -1, &stmt, NULL) != 0) {
+        errx(EXIT_FAILURE, "Failed to prepare statement: %s", sqlite3_errmsg(db));
+    }
+
+    dectoip(ip_dec, ip);
+
+    sqlite3_bind_text(stmt, 1, ip, -1, SQLITE_STATIC);
+
+    rc = sqlite3_step(stmt);
+
+    if (rc == SQLITE_ROW) {
+        const unsigned char *mac_str = sqlite3_column_text(stmt, 0);
+
+        sscanf((const char *)mac_str, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
+               &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]);
+    } else if (rc == SQLITE_DONE) {
+        ogs_info("No MAC address found for IP: %s", ip);
+    } else {
+        errx(EXIT_FAILURE, "Failed to execute statement: %s", sqlite3_errmsg(db));
+    }
+
+    return mac;
+}
 
 uint8_t *pfcp_ue_mac_addr(uint32_t ip);
 uint8_t *pfcp_ue_mac_addr(uint32_t ip) {
-// create table leases(imsi text not null primary key, ip text, starts timestamp, ends timestamp);
+// create table leases(imsi text not null primary key, ip text, mac text, starts timestamp, ends timestamp);
     sqlite3 *db;
+    static uint8_t ue_mac_addr[6];
 
-    if(sqlite3_open("/var/leases.db", &db) != 0) {
+    if (sqlite3_open("/var/leases.db", &db) != 0) {
         errx(EXIT_FAILURE, "Cannot open /var/leases.db: %s", sqlite3_errmsg(db));
     }
+
+    query_mac(db, ip, ue_mac_addr);
+
     sqlite3_close(db);
 
-    uint8_t *ue_mac_addr = malloc(6);
-    ue_mac_addr[0] = 0x0e;
-    ue_mac_addr[1] = 0x00;
-    ue_mac_addr[2] = ip;
-    ue_mac_addr[3] = ip >> 8;
-    ue_mac_addr[4] = ip >> 16;
-    ue_mac_addr[5] = ip >> 24;
     return ue_mac_addr;
 }
 
@@ -160,10 +201,12 @@ static void _gtpv1_tun_recv_common_cb(
                 /* In normal mode, use a fixed MAC address */
                 if(subnet->bridge) {
                     uint8_t *ue_mac_addr;
+                    //ogs_info("CALL pfcp_ue_mac_addr");
                     ue_mac_addr = pfcp_ue_mac_addr(arp_parse_target_addr(recvbuf->data, recvbuf->len));
                     size = arp_reply(replybuf->data, recvbuf->data, recvbuf->len,
                         ue_mac_addr);
-                    free(ue_mac_addr);
+                    // TODO: Ask Gustavo
+                    //free(ue_mac_addr);
                 } else {
                     size = arp_reply(replybuf->data, recvbuf->data, recvbuf->len,
                         proxy_mac_addr);
@@ -698,11 +741,13 @@ static void _gtpv1_u_recv_cb(short when, ogs_socket_t fd, void *data)
                 /* In normal mode, use the MAC address from the interface */
                 if(subnet->bridge) {
                     uint8_t *ue_mac_addr;
+                    //ogs_info("CALL pfcp_ue_mac_addr");
                     ue_mac_addr = pfcp_ue_mac_addr(sess->ipv4->addr[0]);
                     memcpy(pkbuf->data, ue_mac_addr, ETHER_ADDR_LEN);
                     ogs_pkbuf_push(pkbuf, ETHER_ADDR_LEN);
                     memcpy(pkbuf->data, subnet->mac_addr, ETHER_ADDR_LEN);
-                    free(ue_mac_addr);
+                    // TODO: Ask Gustavo
+                    //free(ue_mac_addr);
                 } else {
                     memcpy(pkbuf->data, proxy_mac_addr, ETHER_ADDR_LEN);
                     ogs_pkbuf_push(pkbuf, ETHER_ADDR_LEN);
