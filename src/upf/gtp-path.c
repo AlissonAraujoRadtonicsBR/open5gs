@@ -53,69 +53,48 @@
 #include "pfcp-path.h"
 #include "rule-match.h"
 
+#include <unistd.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+
 #define UPF_GTP_HANDLED     1
-
-#include <sqlite3.h>
-#include <err.h>
-#include <arpa/inet.h>
-
-void dectoip(uint32_t dec, char *ip);
-void dectoip(uint32_t dec, char *ip)
-{
-    struct in_addr ip_addr;
-
-    ip_addr.s_addr = dec;
-
-    if (inet_ntop(AF_INET, &ip_addr, ip, INET_ADDRSTRLEN) == NULL) {
-        ogs_error("inet_ntop failed");
-    }
-}
-
-uint8_t *query_mac(sqlite3 *db, uint32_t ip_dec, uint8_t *mac);
-uint8_t *query_mac(sqlite3 *db, uint32_t ip_dec, uint8_t *mac) {
-    sqlite3_stmt *stmt;
-    const char *query = "SELECT mac FROM leases where ip = ?;";
-    char ip[INET_ADDRSTRLEN];
-    int rc;
-
-    if (sqlite3_prepare_v2(db, query, -1, &stmt, NULL) != 0) {
-        errx(EXIT_FAILURE, "Failed to prepare statement: %s", sqlite3_errmsg(db));
-    }
-
-    dectoip(ip_dec, ip);
-
-    sqlite3_bind_text(stmt, 1, ip, -1, SQLITE_STATIC);
-
-    rc = sqlite3_step(stmt);
-
-    if (rc == SQLITE_ROW) {
-        const unsigned char *mac_str = sqlite3_column_text(stmt, 0);
-
-        sscanf((const char *)mac_str, "%hhx:%hhx:%hhx:%hhx:%hhx:%hhx",
-               &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5]);
-    } else if (rc == SQLITE_DONE) {
-        ogs_info("No MAC address found for IP: %s", ip);
-    } else {
-        errx(EXIT_FAILURE, "Failed to execute statement: %s", sqlite3_errmsg(db));
-    }
-
-    return mac;
-}
+#define SOCKET_PATH "/var/run/ogs_socket"
 
 uint8_t *pfcp_ue_mac_addr(uint32_t ip);
 uint8_t *pfcp_ue_mac_addr(uint32_t ip) {
 // create table leases(imsi text not null primary key, ip text, mac text, starts timestamp, ends timestamp);
-    sqlite3 *db;
+    // TODO: Study xdr
+    int client_fd;
+    struct sockaddr_un address;
     static uint8_t ue_mac_addr[6];
 
-    if (sqlite3_open("/var/leases.db", &db) != 0) {
-        errx(EXIT_FAILURE, "Cannot open /var/leases.db: %s", sqlite3_errmsg(db));
+    // Create the socket
+    if ((client_fd = socket(AF_UNIX, SOCK_STREAM, 0)) == -1) {
+        ogs_error("Socket failed: %s", strerror(errno));
+        exit(EXIT_FAILURE);
     }
 
-    query_mac(db, ip, ue_mac_addr);
+    // Configure the address structure
+    memset(&address, 0, sizeof(struct sockaddr_un));
+    address.sun_family = AF_UNIX;
+    strncpy(address.sun_path, SOCKET_PATH, sizeof(address.sun_path) - 1);
 
-    sqlite3_close(db);
+    // Connect to the server
+    if (connect(client_fd, (struct sockaddr *)&address, sizeof(struct sockaddr_un)) == -1) {
+        ogs_error("Connect failed");
+        close(client_fd);
+        exit(EXIT_FAILURE);
+    }
 
+    if (write(client_fd, &ip, sizeof(ip)) == -1) {
+        ogs_error("Error writing to socket");
+    }
+
+    if (read(client_fd, &ue_mac_addr, sizeof(ue_mac_addr)) < 0) {
+        ogs_error("Error reading from socket");
+    }
+
+    close(client_fd);
     return ue_mac_addr;
 }
 
@@ -201,7 +180,6 @@ static void _gtpv1_tun_recv_common_cb(
                 /* In normal mode, use a fixed MAC address */
                 if(subnet->bridge) {
                     uint8_t *ue_mac_addr;
-                    //ogs_info("CALL pfcp_ue_mac_addr");
                     ue_mac_addr = pfcp_ue_mac_addr(arp_parse_target_addr(recvbuf->data, recvbuf->len));
                     size = arp_reply(replybuf->data, recvbuf->data, recvbuf->len,
                         ue_mac_addr);
